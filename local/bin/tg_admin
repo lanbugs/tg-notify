@@ -1,0 +1,460 @@
+#!/usr/bin/env python
+
+#
+# TG Notification Admin Module
+# Version 0.1 beta
+# Written by Maximilian Thoma 2017
+# Visit https://lanbugs.de for further informations.
+#
+# tgnotify is free software;  you can redistribute it and/or modify it
+# under the  terms of the  GNU General Public License  as published by
+# the Free Software Foundation in version 2.  check_mk is  distributed
+# in the hope that it will be useful, but WITHOUT ANY WARRANTY;  with-
+# out even the implied warranty of  MERCHANTABILITY  or  FITNESS FOR A
+# PARTICULAR PURPOSE. See the  GNU General Public License for more de-
+# tails. You should have  received  a copy of the  GNU  General Public
+# License along with GNU Make; see the file  COPYING.  If  not,  write
+# to the Free Software Foundation, Inc., 51 Franklin St,  Fifth Floor,
+# Boston, MA 02110-1301 USA.
+#
+
+import argparse
+import ConfigParser
+import sqlite3
+import os
+import sys
+import urllib
+import json
+import datetime
+import logging
+
+class TGadmin:
+
+    ####################################################################################################################
+    # Init Class
+    ####################################################################################################################
+    def __init__(self):
+
+        # Check if we are in an OMD_ENVIRONMENT
+        try:
+            self.path = os.environ.pop('OMD_ROOT')
+        except:
+            sys.stderr.write("We are not in an OMD ENVIRONMENT, please go to OMD ROOT")
+            sys.exit(2)
+
+        # Load Telegram Config
+        config = ConfigParser.ConfigParser()
+        config.read(self.path + "/local/etc/tg.ini")
+
+        # Define basic parameters
+        self.tg_url = config.get('Telegram', 'url') + config.get('Telegram', 'token') + "/"
+        self.db_path = self.path + "/" + config.get('Database', 'path')
+        self.db_file = config.get('Database', 'file')
+
+        # Start logging engine
+        self.L = logging.getLogger("tg_admin")
+
+        # Get Commandline Options and call sub program
+        parser = argparse.ArgumentParser(description="tg_admin - Telegram Notfications for Check_MK - Admin Module")
+        parser.add_argument('--initialize-database', dest='init', action='store_true', help="Initialize batabase")
+        parser.add_argument('-c', '--create', dest='create', action='store_true' , help="Create new user (chat_id required)")
+        parser.add_argument('-d', '--delete', dest='delete', action='store_true', help="Delete existing user")
+        parser.add_argument('-u', '--user', dest='user', help="Username")
+        parser.add_argument('-i', '--id', dest='chat_id', help="Chat_ID for new User")
+        parser.add_argument('-s', '--show', dest='show', action='store_true', help="Show current users")
+        parser.add_argument('--show-agent', dest='show_agent', action='store_true', help="Show new users which "
+                                                                                         "send \"open\" to the bot to "
+                                                                                         "determine chat_id")
+        parser.add_argument('--clean-notify-history', dest='clean_history', action='store_true', help="Clean "
+                                                                                               "Notification history")
+        parser.add_argument('--show-notify-history', dest='show_history', action='store_true', help="Show "
+                                                                                               "Notification history")
+        #parser.add_argument('--collect-callbacks', dest='collect_callbacks', action='store_true', help="Collects "
+        #                                                                                               "callbacks "
+        #                                                                                               "from Telegram")
+        parser.add_argument('--generate-cronjobs', dest='generate_cronjobs', action='store_true', help="Generate Cronjob" \
+                                                                                                      " Files, restart of cron" \
+                                                                                                      " daemon required!")
+        parser.add_argument('--show-callbacks', dest='show_callbacks', action='store_true', help="Show callbacks")
+        parser.add_argument('--install-logrotate', dest='install_logrotate', action='store_true', help="Install logrotate scripts")
+        parser.add_argument('-v', '--verbose', dest='verbose', action='store_true', help='increase output verbosity')
+        parser.add_argument('--setup', dest='setup', action='store_true', help='complete setup of tg_notify environment, tg.ini required!')
+
+        self.args = parser.parse_args()
+
+        if self.args.verbose:
+            # Load logging engine & log
+            logging.basicConfig(filename=self.path + '/var/log/tg-notify.log',
+                                level=logging.DEBUG,
+                                format='%(asctime)s %(name)-16s %(levelname)-8s %(message)s',
+                                datefmt='%d.%m.%Y %H:%M:%S')
+            self.L.debug("Debug logging is enabled.")
+
+        else:
+            # Load logging engine & log
+            logging.basicConfig(filename=self.path + '/var/log/tg-notify.log',
+                                level=logging.INFO,
+                                format='%(asctime)s %(name)-16s %(levelname)-8s %(message)s',
+                                datefmt='%d.%m.%Y %H:%M:%S')
+
+        if self.args.init:
+            self.create_database()
+
+        elif self.args.show_agent:
+            self.show_agent()
+
+        elif self.args.create:
+            self.create_user(self.args.user, self.args.chat_id)
+
+        elif self.args.show:
+            self.show_user()
+
+        elif self.args.delete:
+            self.delete_user(self.args.user, self.args.chat_id)
+
+        elif self.args.clean_history:
+            self.clean_history()
+
+        elif self.args.show_history:
+            self.show_history()
+
+        #elif self.args.collect_callbacks:
+        #    self.collect_callbacks()
+
+        elif self.args.generate_cronjobs:
+            self.generate_cronjobs()
+
+        elif self.args.show_callbacks:
+            self.show_callbacks()
+
+        elif self.args.install_logrotate:
+            self.install_logrotate()
+
+        elif self.args.setup:
+            self.install_tg_notify()
+
+        else:
+            print "Please choose option, see -h or --help"
+
+
+
+    ####################################################################################################################
+    # Create Database
+    ####################################################################################################################
+    def create_database(self):
+
+        # Check if folder exist
+        if not os.path.exists(self.db_path):
+            os.makedirs(self.db_path)
+
+        # Init database schema
+        con = sqlite3.connect(self.db_path + self.db_file)
+        cur = con.cursor()
+
+        try:
+            # Every notification is stored for 24h hours, only for notifications
+            # which are in this table callback commands can be executed
+            # After 24h the table will be auto cleaned
+            cur.execute("""
+                        CREATE TABLE `notify` (
+                        `id`	INTEGER PRIMARY KEY AUTOINCREMENT,
+                        `callback_ident`	TEXT UNIQUE,
+                        `host`	TEXT,
+                        `service`	TEXT,
+                        `chat_id`	INTEGER,
+                        `datetime`	INTEGER
+                        );
+                        """)
+
+            # The username to chat_id matching
+            cur.execute("""
+                        CREATE TABLE `users` (
+                        `username`	TEXT,
+                        `chat_id`	INTEGER
+                        );
+                        """)
+
+            # Callbacks recived from the users, only callbacks will be executed where an notifcation entry exists
+            cur.execute("""
+                        CREATE TABLE `callbacks` (
+                        `chat_id`	INTEGER,
+                        `datetime`	INTEGER,
+                        `command`	TEXT,
+                        `callback_id`	TEXT,
+                        `executed`	INTEGER DEFAULT 0
+                        );
+                        """)
+
+        except sqlite3.Error as er:
+            sys.stderr.write('Error: ' + er.message + "\n")
+            sys.exit(2)
+
+        # Commit
+        con.commit()
+
+        # Close connection
+        cur.close()
+
+    ####################################################################################################################
+    # DB Handler
+    ####################################################################################################################
+    def db_handler(self):
+        self.con = sqlite3.connect(self.db_path + self.db_file)
+        self.cur = self.con.cursor()
+
+    ####################################################################################################################
+    # Handler for Telegram communication
+    ####################################################################################################################
+    def tg_handler(self, command):
+        try:
+            handle = urllib.urlopen(self.tg_url + command)
+            response = handle.read().strip()
+            j = json.loads(response)
+
+        except Exception:
+            import traceback
+            sys.stderr.write('generic exception: ' + traceback.format_exc())
+            sys.exit(2)
+
+        if j['ok'] is True:
+            return j
+        else:
+            return {}
+
+    ####################################################################################################################
+    # Show Agent last open requests
+    ####################################################################################################################
+    def show_agent(self):
+
+        msg = self.tg_handler("getUpdates")
+
+        if len(msg) >= 1:
+            # Go trough the messages
+            for m in msg['result']:
+                # if in message open show informations
+                if "open" in m['message']['text']:
+                    print "----------------------------------------------------------------"
+                    print "First Name: %s" % m['message']['from']['first_name']
+                    print "Last Name: %s" % m['message']['from']['last_name']
+                    print "CHAT ID: %s" % m['message']['from']['id']
+                    print "----------------------------------------------------------------"
+        else:
+            print "No messages in queue"
+
+    ####################################################################################################################
+    # Create User
+    ####################################################################################################################
+    def create_user(self, user, chat_id):
+
+        self.db_handler()
+
+        try:
+            self.cur.execute("""INSERT INTO users (username, chat_id) VALUES('%s', %s)""" %(user, chat_id))
+
+        except sqlite3.Error as er:
+            sys.stderr.write('Error: ' + er.message + "\n")
+            sys.exit(2)
+
+        # Commit
+        self.con.commit()
+
+        # Close connection
+        self.cur.close()
+
+    ####################################################################################################################
+    # Show User
+    ####################################################################################################################
+    def show_user(self):
+
+        self.db_handler()
+
+        self.cur.execute("""SELECT * FROM users""")
+
+        result = self.cur.fetchall()
+        print 'Current User:\n'
+        print '%-12s%-12s' % ("Username", "Chat_ID")
+        print '------------------------'
+        if len(result) >= 1:
+            for r in result:
+                print '%-12s%-12s' % r
+        else:
+            print "No users exist."
+
+        # Exit Database
+        self.cur.close()
+
+    ####################################################################################################################
+    # Delete User
+    ####################################################################################################################
+    def delete_user(self, user, chat_id):
+
+        self.db_handler()
+
+        try:
+            self.cur.execute("""DELETE FROM users WHERE username='%s' AND chat_id=%s""" %(user, chat_id))
+            print "User %s with Chat_ID %s deleted!" % (user, chat_id)
+        except sqlite3.Error as er:
+            sys.stderr.write('Error: ' + er.message + "\n")
+            sys.exit(2)
+
+        self.con.commit()
+
+        self.cur.close()
+
+    ####################################################################################################################
+    # Clean Notification History
+    ####################################################################################################################
+    def clean_history(self):
+
+        self.db_handler()
+
+        try:
+            self.cur.execute("""DELETE FROM notify""")
+
+        except sqlite3.Error as er:
+            sys.stderr.write("Can not delete table notify.")
+            sys.exit(2)
+
+        self.con.commit()
+
+        self.cur.close()
+
+    ####################################################################################################################
+    # Show Notification History
+    ####################################################################################################################
+    def show_history(self):
+
+        self.db_handler()
+
+        try:
+            self.cur.execute("""SELECT notify.*, users.username FROM notify LEFT JOIN users ON notify.chat_id = users.chat_id""")
+        except sqlite3.Error as er:
+            sys.stderr.write("Can not fetch data from notify table")
+            sys.exit(2)
+
+        result = self.cur.fetchall()
+
+        print "%-4s%-20s%-20s%-40s%-20s%-10s%-10s" %("ID", "Callback ID", "Host", "Service", "Datum", "Chat_ID", "Username")
+        print "-" * 130
+
+        for r in result:
+            id, callback_id, host, service, chat_id, timestamp, username = r
+
+            print "%-4s%-20s%-20s%-40s%-20s%-10s%-10s" % (id,
+                                                          callback_id,
+                                                          host,
+                                                          service,
+                                                          datetime.datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S'),
+                                                          chat_id,
+                                                          username)
+
+        self.cur.close()
+
+
+    ####################################################################################################################
+    # Generate Cronjobs
+    ####################################################################################################################
+    def generate_cronjobs(self):
+
+        #Cron Folder
+        cron_path = self.path + "/etc/cron.d/"
+
+        # Steps
+
+        # Step 1: Create callback collector & execute the callback agent
+        cb_collect_cb_agent = "* * * * * . $OMD_ROOT/local/bin/tg_callback >/dev/null 2>&1"
+
+        with open(cron_path + 'tg_collect_and_callback_agent', 'w+') as f:
+            f.write(cb_collect_cb_agent + '\n')
+            f.close()
+
+        #TODO: Step 2: Create cleanup job
+
+        sys.stdout.write("Cronjobs generated ... restart cron daemon with \"omd restart crontab\".\n")
+
+    ####################################################################################################################
+    # Show Callbacks
+    ####################################################################################################################
+    def show_callbacks(self):
+
+        # Load db
+        self.db_handler()
+
+        # Query for Callbacks
+        self.cur.execute("""SELECT callbacks.*, users.username, notify.host, notify.service FROM callbacks 
+                       LEFT JOIN users ON callbacks.chat_id=users.chat_id
+                       LEFT JOIN notify ON callbacks.callback_id=notify.callback_ident""")
+
+        # Results
+        results = self.cur.fetchall()
+
+        if len(results)>=1:
+            print "%-20s%-20s%-40s%-20s%-10s%-2s" %("Callback ID","Host","Service","Datum","Command", "Executed")
+            print "-" * 130
+            for r in results:
+
+                chat_id, date_time, command, callback_id, executed, username, host, service = r
+
+                print "%-20s%-20s%-40s%-20s%-10s%-2s" % (callback_id,
+                                                         host,
+                                                         service,
+                                                         datetime.datetime.fromtimestamp(date_time).strftime('%Y-%m-%d %H:%M:%S'),
+                                                         command,
+                                                         executed)
+        else:
+            sys.stdout.write("Nothing found in database ...\n")
+
+        self.con.close()
+
+
+    ####################################################################################################################
+    # Install Logrotate script
+    ####################################################################################################################
+    def install_logrotate(self):
+
+        # Logrotate.d Folder
+        logrotate_path = self.path + "/etc/logrotate.d/"
+
+        # Steps
+
+        # Step 1:
+        logrotate_config = """%s/var/log/tg-notify.log {
+        missingok
+        rotate 7
+        compress
+        delaycompress
+        notifempty
+        }
+
+        """ % self.path
+
+        with open(logrotate_path + 'tg-notify', 'w+') as f:
+            f.write(logrotate_config + '\n')
+            f.close()
+
+        sys.stdout.write("Logrotate config generated ... restart logrotate daemon.\n")
+
+    ####################################################################################################################
+    # Install TG Notify
+    ####################################################################################################################
+    def install_tg_notify(self):
+
+        # 1. Create Database
+        self.create_database()
+
+        # 2. Create Cronjobs
+        self.generate_cronjobs()
+
+        # 3. Create Logrotate definitions
+        self.install_logrotate()
+
+        sys.stdout.write("Restart OMD Environment to finish installation.\n")
+
+
+def main():
+    TGadmin()
+
+if __name__ == "__main__":
+    main()
+
+

@@ -1,0 +1,5 @@
+#!/bin/bash
+
+tg_admin --collect-callbacks
+sleep 5
+tg_callback

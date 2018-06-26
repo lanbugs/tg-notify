@@ -1,0 +1,329 @@
+#!/usr/bin/env python
+
+#
+# TG Callback Module
+# Version 0.1 beta
+# Written by Maximilian Thoma 2017
+# Visit https://lanbugs.de for further informations.
+#
+# tgnotify is free software;  you can redistribute it and/or modify it
+# under the  terms of the  GNU General Public License  as published by
+# the Free Software Foundation in version 2.  check_mk is  distributed
+# in the hope that it will be useful, but WITHOUT ANY WARRANTY;  with-
+# out even the implied warranty of  MERCHANTABILITY  or  FITNESS FOR A
+# PARTICULAR PURPOSE. See the  GNU General Public License for more de-
+# tails. You should have  received  a copy of the  GNU  General Public
+# License along with GNU Make; see the file  COPYING.  If  not,  write
+# to the Free Software Foundation, Inc., 51 Franklin St,  Fifth Floor,
+# Boston, MA 02110-1301 USA.
+#
+
+import ConfigParser
+import sqlite3
+import os
+import sys
+import urllib
+import time
+import json
+import logging
+import argparse
+
+class TGcallback:
+
+    def __init__(self):
+
+        # Check if we are in an OMD_ENVIRONMENT
+        try:
+            self.path = os.environ.pop('OMD_ROOT')
+        except:
+            sys.stderr.write("We are not in an OMD ENVIRONMENT, please go to OMD ROOT")
+            sys.exit(2)
+
+        # Load Config
+        config = ConfigParser.ConfigParser()
+        config.read(self.path + "/local/etc/tg.ini")
+
+        #ARG Parse
+        parser = argparse.ArgumentParser(description="tg_callback - Telegram Notfications for Check_MK - Callback Module")
+        parser.add_argument('-v', '--verbose', dest='verbose', action='store_true', help='increase output verbosity')
+
+        self.args = parser.parse_args()
+
+        # Set global default parameters
+        self.tg_url = config.get('Telegram', 'url') + config.get('Telegram', 'token') + "/"
+        self.db_path = self.path + "/" + config.get('Database', 'path')
+        self.db_file = config.get('Database', 'file')
+        self.cmk_url = config.get('Check_MK', 'url')
+        self.cmk_a_user = config.get('Check_MK', 'automation_user')
+        self.cmk_a_pass = config.get('Check_MK', 'automation_pass')
+
+        # Start logging engine
+        self.L = logging.getLogger("tg_callback")
+
+        if self.args.verbose:
+            # Load logging engine & log
+            logging.basicConfig(filename=self.path + '/var/log/tg-notify.log',
+                                level=logging.DEBUG,
+                                format='%(asctime)s %(name)-16s %(levelname)-8s %(message)s',
+                                datefmt='%d.%m.%Y %H:%M:%S')
+            self.L.debug("Debug logging is enabled.")
+
+        else:
+            # Load logging engine & log
+            logging.basicConfig(filename=self.path + '/var/log/tg-notify.log',
+                                level=logging.INFO,
+                                format='%(asctime)s %(name)-16s %(levelname)-8s %(message)s',
+                                datefmt='%d.%m.%Y %H:%M:%S')
+
+        # Create Database connection
+        self.con = sqlite3.connect(self.db_path + self.db_file)
+        self.cur = self.con.cursor()
+
+        # Collect callbacks
+        self.collect_callbacks()
+
+        # Work on callbacks
+        self.main_handler()
+
+    ####################################################################################################################
+    # Main Handler
+    ####################################################################################################################
+    def main_handler(self):
+        self.L.debug("Starting main handler ...")
+
+        self.cur.execute("""SELECT callbacks.*, notify.host, notify.service, users.username FROM callbacks  
+                            LEFT JOIN notify ON callbacks.callback_id=notify.callback_ident 
+                            LEFT JOIN users ON users.chat_id=callbacks.chat_id WHERE executed=0""")
+
+        result = self.cur.fetchall()
+        self.L.debug("Results of quering callback table: %s", result)
+
+        if len(result) >= 1:
+            # do it
+            for r in result:
+                chat_id, datetime, command, callback_id, executed, host, service, username = r
+                self.L.debug("Working on job %s", r)
+
+                if command == "ack":
+                    self.ack_handler(r)
+                elif "down" in command:
+                    self.downtime_handler(r)
+                else:
+                    sys.stderr.write("No handler found for command. exiting ...")
+                    sys.exit(2)
+
+        else:
+            self.L.info("Nothing to do ...")
+            #sys.exit(0)
+
+    ####################################################################################################################
+    # CMK Handler
+    ####################################################################################################################
+    def cmk_handler(self,url_segments):
+
+        # segments are an dictionary
+        # {"key": "value"} => key=value
+
+        # Build URL
+
+        url = self.cmk_url + "view.py?output_format=JSON&_username=" + self.cmk_a_user + "&_secret=" + self.cmk_a_pass \
+              + "&_do_confirm&_transid=-1&_do_actions=yes&" + urllib.urlencode(url_segments)
+
+        self.L.debug("CMK Handler URL: %s", url)
+
+        handle = urllib.urlopen(url)
+        response = handle.read().strip()
+
+        if len(response) >= 1:
+            if "Successfully" in response:
+                self.L.info("URL call was successful.")
+            else:
+                self.L.warning("URL call was NOT successful.")
+        else:
+            return None
+
+    ####################################################################################################################
+    # Handler for Telegram communication
+    ####################################################################################################################
+    def tg_handler(self, command):
+        try:
+            handle = urllib.urlopen(self.tg_url + command)
+            response = handle.read().strip()
+            j = json.loads(response)
+
+        except Exception:
+            import traceback
+            sys.stderr.write('generic exception: ' + traceback.format_exc())
+            sys.exit(2)
+
+        if j['ok'] is True:
+            return j
+        else:
+            return {}
+
+    ####################################################################################################################
+    # Collect Callbacks
+    ####################################################################################################################
+    def collect_callbacks(self):
+
+        # Steps:
+
+        # Step 1: Collect from Telegram all Messages with $$$CB$$$
+        data = self.tg_handler("getUpdates")
+
+        self.L.debug("Get updates from telegram: %s", data)
+
+        if data.has_key('ok'):
+            if data['ok'] is not True:
+                sys.stderr.write("Could not connect telegram API.")
+                sys.exit(2)
+
+        # Step 2: Check if they exist already in callback table if not add it
+
+        # Work on results
+        for r in data['result']:
+
+            # Check if callbacks exist
+            if r.has_key('callback_query'):
+
+                callback_string = r['callback_query']['data']
+                chat_id = r['callback_query']['from']['id']
+
+                callback_id, callback_command = callback_string.replace("$$$CB$$$", "").split(":")
+
+                timestamp = int(time.time())
+
+                self.L.info("New callback %s", callback_id)
+                self.L.info("New command is %s", callback_command)
+
+                # Verify if exist in callback table
+                self.cur.execute("""SELECT * FROM callbacks WHERE chat_id=%s AND 
+                               callback_id='%s' AND command='%s'""" % (chat_id, callback_id, callback_command))
+
+                result_check = self.cur.fetchall()
+
+                self.L.debug("Quering if callback exist: %s", result_check)
+
+                if len(result_check) == 0:
+                    # Create
+                    self.cur.execute("""INSERT INTO callbacks (chat_id, datetime, command, callback_id, executed) VALUES 
+                                (%s, %s, '%s', '%s', 0)""" % (chat_id,
+                                                              timestamp,
+                                                              callback_command,
+                                                              callback_id))
+                    self.con.commit()
+                    self.L.info("Callback not exist and will be created.")
+
+                else:
+                    self.L.debug("Callback already exist.")
+
+                # Step 3: Send Commit Message to requester
+                if len(result_check) == 0:
+                    message = "Callback generated. ID: %s, Command: %s" % (callback_id, callback_command)
+
+                    self.tg_handler("sendMessage?" + urllib.urlencode([("chat_id", chat_id),
+                                                                       ("text", message),
+                                                                       ])
+                                    )
+
+    ####################################################################################################################
+    # Acknowledge Handler
+    ####################################################################################################################
+    def ack_handler(self, job):
+        chat_id, datetime, command, callback_id, executed, host, service, username = job
+
+        if service != "None":
+            seg = {
+                "service": service,
+                "host": host,
+                "view_name": "service",
+                "_ack_comment": "Telegram callback from user " + username,
+                "_ack_expire_days": "0",
+                "_ack_expire_hours": "0",
+                "_ack_expire_minutes": "0",
+                "_ack_notify": "on",
+                "_ack_sticky": "on",
+                "_acknowledge": "Acknowledge",
+                "actions": "yes",
+                "filled_in": "confim"
+            }
+        else:
+            seg = {
+                "host": host,
+                "view_name": "hostproblems",
+                "_ack_comment": "Telegram callback from user " + username,
+                "_ack_expire_days": "0",
+                "_ack_expire_hours": "0",
+                "_ack_expire_minutes": "0",
+                "_ack_notify": "on",
+                "_ack_sticky": "on",
+                "_acknowledge": "Acknowledge",
+                "actions": "yes",
+                "filled_in": "confim"
+            }
+
+        self.cmk_handler(seg)
+
+        self.cur.execute("""UPDATE callbacks SET executed=1 WHERE callback_id='%s' AND command = '%s'""" % (callback_id,
+                                                                                                            command))
+        self.con.commit()
+
+    ####################################################################################################################
+    # Downtime Handler
+    ####################################################################################################################
+    def downtime_handler(self, job):
+        chat_id, datetime, command, callback_id, executed, host, service, username = job
+
+        if service != "None" and "24h" in command:
+            seg = {
+                "service": service,
+                "host": host,
+                "view_name": "service",
+                "_down_comment": "Telegram callback from user " + username,
+                "_down_from_now": "yes",
+                "_down_minutes": "1440",
+                "actions": "yes",
+                "filled_in": "confim"
+            }
+        elif "24h" in command:
+            seg = {
+                "host": host,
+                "view_name": "hostproblems",
+                "_down_comment": "Telegram callback from user " + username,
+                "_down_from_now": "yes",
+                "_down_minutes": "1440",
+                "actions": "yes",
+                "filled_in": "confim"
+            }
+
+        self.cmk_handler(seg)
+
+        self.cur.execute("""UPDATE callbacks SET executed=1 WHERE callback_id='%s' AND command = '%s'""" % (callback_id,
+                                                                                                            command))
+        self.con.commit()
+
+    ####################################################################################################################
+    # DB Close
+    ####################################################################################################################
+    def db_close(self):
+        self.con.close()
+
+
+def main():
+    t = TGcallback()
+    t.db_close()
+
+# Execute main program
+#############################
+if __name__ == "__main__":
+    pid = str(os.getpid())
+    pidfile = "/tmp/tg_callback.pid"
+
+    if os.path.isfile(pidfile):
+        print "%s already exists, exiting" % pidfile
+        sys.exit()
+    file(pidfile, 'w').write(pid)
+    try:
+        main()
+    finally:
+        os.unlink(pidfile)
