@@ -204,7 +204,7 @@ class TGnotification:
                                                                ]))
 
         # Step 5: Write to STDOUT
-        sys.stdout.write("Notification send to %s (Chat_ID: %S)" % (username,chat_id))
+        sys.stdout.write("Notification send to %s (Chat_ID: %s)" % (username,chat_id))
 
         # Step 6: Close DB
         con.close()
